@@ -22,12 +22,13 @@ import java.io.UncheckedIOException;
 import java.net.URL;
 import java.util.function.Supplier;
 
+import com.here.account.auth.NoAuthorizer;
 import com.here.account.client.Client;
+import com.here.account.http.HttpConstants;
 import com.here.account.http.HttpConstants.HttpMethods;
 import com.here.account.http.HttpProvider;
-import com.here.account.util.JacksonSerializer;
-import com.here.account.util.RefreshableResponseProvider;
-import com.here.account.util.Serializer;
+import com.here.account.oauth2.bo.TimestampResponse;
+import com.here.account.util.*;
 
 /**
  * Static entry point to access HERE Account via the OAuth2.0 API.  This class
@@ -144,20 +145,71 @@ public class HereAccount {
      * automatically be injected with the given client credentials.
      * 
      * @param httpProvider the HTTP-layer provider implementation
-     * @param clientCredentialsProvider identifies the token endpoint URL and
+     * @param clientAuthorizationRequestProvider identifies the token endpoint URL and
      *     client credentials to be injected into requests
      * @return a {@code TokenEndpoint} representing access for the provided client
      */
     public static TokenEndpoint getTokenEndpoint(
             HttpProvider httpProvider,
-            ClientAuthorizationRequestProvider clientCredentialsProvider) {
-        return getTokenEndpoint(httpProvider, clientCredentialsProvider, new JacksonSerializer());
+            ClientAuthorizationRequestProvider clientAuthorizationRequestProvider) {
+        return getTokenEndpoint(
+                reuseClock(clientAuthorizationRequestProvider),
+                httpProvider, clientAuthorizationRequestProvider, new JacksonSerializer());
     }
-    
-    public static TokenEndpoint getTokenEndpoint(HttpProvider httpProvider,
+
+    /**
+     * If we can re-use the Clock, then corrections made by HereAccount will agree
+     * with the ones the clientAuthorizationRequestProvider/OAuth1Signer uses.
+     * Otherwise, if clientAuthorizationRequestProvider is null, or its clock is
+     * null, a SettableSystemClock is returned.
+     *
+     * @param clientAuthorizationRequestProvider the authorization provider
+     * @return the clock to use
+     */
+    static Clock reuseClock(ClientAuthorizationRequestProvider clientAuthorizationRequestProvider) {
+        Clock clock = null;
+        if (null != clientAuthorizationRequestProvider) {
+            clock = clientAuthorizationRequestProvider.getClock();
+        }
+        if (null == clock) {
+            clock = new SettableSystemClock();
+        }
+        return clock;
+    }
+
+    public static TokenEndpoint getTokenEndpoint(
+                                                 HttpProvider httpProvider,
+                                                 ClientAuthorizationRequestProvider clientAuthorizationRequestProvider,
+                                                 Serializer serializer) {
+        return getTokenEndpoint(reuseClock(clientAuthorizationRequestProvider),
+                httpProvider, clientAuthorizationRequestProvider, serializer);
+    }
+
+
+    /**
+     * Get the ability to run various Token Endpoint API calls to the
+     * HERE Account Authorization Server.
+     * See OAuth2.0
+     * <a href="https://tools.ietf.org/html/rfc6749#section-4">Obtaining Authorization</a>.
+     *
+     * The returned {@code TokenEndpoint} exposes an abstraction to make calls
+     * against the OAuth2 token endpoint identified by the given client credentials
+     * provider.  In addition, all calls made against the returned endpoint will
+     * automatically be injected with the given client credentials.
+     *
+     * @param clock the clock implementation to use
+     * @param httpProvider the HTTP-layer provider implementation
+     * @param clientCredentialsProvider identifies the token endpoint URL and
+     *     client credentials to be injected into requests
+     * @param serializer the Serializer to use
+     * @return a {@code TokenEndpoint} representing access for the provided client
+     */
+    public static TokenEndpoint getTokenEndpoint(Clock clock,
+                                                 HttpProvider httpProvider,
             ClientAuthorizationRequestProvider clientCredentialsProvider,
             Serializer serializer) {
-        return new TokenEndpointImpl(httpProvider, clientCredentialsProvider, serializer);
+        return new TokenEndpointImpl(clock,
+                httpProvider, clientCredentialsProvider, serializer);
     }
     
     /**
@@ -166,8 +218,10 @@ public class HereAccount {
      * you will always get a current HERE Access Token, 
      * for the grant_type=client_credentials use case, for 
      * confidential clients.
-     * 
+     *
+     * @param clock the clock to use
      * @param tokenEndpoint the token endpoint to request tokens
+     * @param accessTokenRequestFactory the Supplier of AccessTokenRequests
      * @return the refreshable response provider presenting an always "fresh" client_credentials-based HERE Access Token.
      * @throws AccessTokenException if you had trouble authenticating your request to the authorization server, 
      *      or the authorization server rejected your request
@@ -175,9 +229,11 @@ public class HereAccount {
      * @throws ResponseParsingException if trouble parsing the response
      */
     private static RefreshableResponseProvider<AccessTokenResponse> getRefreshableClientTokenProvider(
-            TokenEndpoint tokenEndpoint, Supplier<AccessTokenRequest> accessTokenRequestFactory) 
+            Clock clock,
+            TokenEndpoint tokenEndpoint, Supplier<AccessTokenRequest> accessTokenRequestFactory)
             throws AccessTokenException, RequestExecutionException, ResponseParsingException {
         return new RefreshableResponseProvider<>(
+                clock,
                 null,
                 tokenEndpoint.requestToken(accessTokenRequestFactory.get()),
                 (AccessTokenResponse previous) -> {
@@ -186,7 +242,9 @@ public class HereAccount {
                     } catch (AccessTokenException | RequestExecutionException | ResponseParsingException e) {
                         throw new RuntimeException("trouble refresh: " + e, e);
                     }
-                });
+                },
+                RefreshableResponseProvider.getScheduledExecutorServiceSize1()
+        );
     }
     
     /**
@@ -198,7 +256,9 @@ public class HereAccount {
          */
         @Deprecated
         public static final String HTTP_METHOD_POST = "POST";
-        
+
+        private final boolean currentTimeMillisSettable;
+        private final Clock clock;
         private final Client client;
         private final HttpProvider httpProvider;
         private final HttpMethods httpMethod;
@@ -215,10 +275,14 @@ public class HereAccount {
          * and provides access token request objects
          * @param serializer used to serialize json To pojo and vice versa
          */
-        private TokenEndpointImpl(HttpProvider httpProvider, ClientAuthorizationRequestProvider clientAuthorizationProvider,
+        private TokenEndpointImpl(
+                Clock clock,
+                HttpProvider httpProvider, ClientAuthorizationRequestProvider clientAuthorizationProvider,
                 Serializer serializer) {
             // these values are fixed once selected
+            this.clock = clock;
             this.url = clientAuthorizationProvider.getTokenEndpointUrl();
+            setTimestampUrl();
             this.clientAuthorizer = clientAuthorizationProvider.getClientAuthorizer();
             this.httpMethod = clientAuthorizationProvider.getHttpMethod();
 
@@ -229,6 +293,8 @@ public class HereAccount {
                     .build();
             this.httpProvider = httpProvider;
             this.serializer = serializer;
+
+            this.currentTimeMillisSettable = clock instanceof SettableClock;
         }
         
         protected AccessTokenResponse requestTokenFromFile() 
@@ -253,11 +319,12 @@ public class HereAccount {
             if (isRequestTokenFromFile()) {
                 return requestTokenFromFile();
             } else {
-                return requestTokenHttp(authorizationRequest);
+                return requestTokenHttp(authorizationRequest, 1);
             }
         }
         
-        protected AccessTokenResponse requestTokenHttp(AccessTokenRequest authorizationRequest) 
+        protected AccessTokenResponse requestTokenHttp(AccessTokenRequest authorizationRequest,
+                                                       int retryFixableErrorsCount)
                 throws AccessTokenException, RequestExecutionException, ResponseParsingException {            
             String method = httpMethod.getMethod();
             
@@ -265,18 +332,68 @@ public class HereAccount {
             // OAuth2.0 uses application/x-www-form-urlencoded
             httpRequest = httpProvider.getRequest(
                 clientAuthorizer, method, url, authorizationRequest.toFormParams());
-            
-            return client.sendMessage(httpRequest, AccessTokenResponse.class,
-                    ErrorResponse.class, (statusCode, errorResponse) -> {
-                        return new AccessTokenException(statusCode, errorResponse);                        
-                    });
+
+            try {
+                return client.sendMessage(httpRequest, AccessTokenResponse.class,
+                        ErrorResponse.class, (statusCode, errorResponse) -> {
+                            return new AccessTokenException(statusCode, errorResponse);
+                        });
+            } catch (AccessTokenException e) {
+                return handleFixableErrors(authorizationRequest, retryFixableErrorsCount, e);
+            }
+        }
+
+        private static final int CLOCK_SKEW_STATUS_CODE = 401;
+        private static final int CLOCK_SKEW_ERROR_CODE = 401204;
+        private static final long CONVERT_SECONDS_TO_MILLISECONDS = 1000L;
+
+        private static final String SLASH_TOKEN = "/oauth2/token";
+        private static final String SLASH_TIMESTAMP = "/timestamp";
+        private final NoAuthorizer noAuthorizer = new NoAuthorizer();
+
+        private String timestampUrl;
+
+        protected void setTimestampUrl() {
+            if (url.endsWith(SLASH_TOKEN)) {
+                timestampUrl = url.substring(0, url.length() - SLASH_TOKEN.length()) + SLASH_TIMESTAMP;
+            }
+        }
+
+        protected AccessTokenResponse handleFixableErrors(AccessTokenRequest authorizationRequest,
+                                                          int retryFixableErrorsCount,
+                                                          AccessTokenException e) {
+            ErrorResponse errorResponse;
+            if (retryFixableErrorsCount > 0 && null != timestampUrl && null != e
+                && CLOCK_SKEW_STATUS_CODE == e.getStatusCode()
+                && null != (errorResponse = e.getErrorResponse()) && CLOCK_SKEW_ERROR_CODE == errorResponse.getErrorCode()
+                && currentTimeMillisSettable) {
+
+                // we have a clock skew
+                String method = HttpConstants.HttpMethods.GET.getMethod();
+
+                HttpProvider.HttpRequest httpRequest;
+                httpRequest = httpProvider.getRequest(
+                        noAuthorizer, method, timestampUrl, (String) null);
+
+                TimestampResponse timestampResponse = client.sendMessage(httpRequest, TimestampResponse.class,
+                        ErrorResponse.class, (statusCode, errorResponse2) -> {
+                            return new AccessTokenException(statusCode, errorResponse2);
+                        });
+                // correct the Clock
+                long timestamp = timestampResponse.getTimestamp();
+                ((SettableClock) clock).setCurrentTimeMillis(timestamp * CONVERT_SECONDS_TO_MILLISECONDS);
+
+                // retry
+                return requestTokenHttp(authorizationRequest, retryFixableErrorsCount - 1);
+            }
+            throw e;
         }
         
         //@Override
         public Fresh<AccessTokenResponse> requestAutoRefreshingToken(Supplier<AccessTokenRequest> requestSupplier) 
                 throws AccessTokenException, RequestExecutionException, ResponseParsingException {
             final RefreshableResponseProvider<AccessTokenResponse> refresher = 
-                    HereAccount.getRefreshableClientTokenProvider(this, requestSupplier);
+                    HereAccount.getRefreshableClientTokenProvider(clock, this, requestSupplier);
             return new Fresh<AccessTokenResponse>() {
 
                 /**

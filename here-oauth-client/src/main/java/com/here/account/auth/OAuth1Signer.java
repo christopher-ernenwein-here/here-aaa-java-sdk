@@ -46,7 +46,7 @@ public class OAuth1Signer implements HttpProvider.HttpRequestAuthorizer {
     private static final int NONCE_LENGTH = 6;
     
     private final Clock clock;
-    
+
     /**
      * HERE client accessKeyId.  Becomes the value of oauth_consumer_key in the 
      * Authorization: OAuth header.

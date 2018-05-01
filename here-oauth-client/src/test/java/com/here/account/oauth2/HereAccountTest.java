@@ -25,7 +25,11 @@ import java.io.UncheckedIOException;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ScheduledExecutorService;
 
+import com.here.account.util.Clock;
+import com.here.account.util.JacksonSerializer;
+import com.here.account.util.SettableSystemClock;
 import org.junit.Assert;
 import org.junit.Ignore;
 import org.junit.Test;
@@ -254,15 +258,27 @@ public class HereAccountTest extends AbstractCredentialTezt {
                 + " \"access_token\": \"67890\","
                 + " \"expires_in\": 30"
                 + "}";
+        final long sleepTimeMillis = 1000L;
+        Clock mySettableClock = new SettableSystemClock() {
+            @Override
+            public void schedule(ScheduledExecutorService scheduledExecutorService,
+                                             Runnable runnable,
+                                             long millisecondsInTheFutureToSchedule
+            ) {
+                super.schedule(scheduledExecutorService, runnable, sleepTimeMillis);
+            }
+        };
         
         TokenEndpoint tokenEndpoint = HereAccount.getTokenEndpoint(
+                mySettableClock,
                 mockHttpProvider(dummyResponse(200, 
                                                validToken1.getBytes().length, 
                                                new ByteArrayInputStream(validToken1.getBytes("UTF-8"))),
                                  dummyResponse(200,
                                                validToken2.getBytes().length,
                                                new ByteArrayInputStream(validToken2.getBytes("UTF-8")))),
-                new OAuth1ClientCredentialsProvider(url, accessKeyId, accessKeySecret));
+                new OAuth1ClientCredentialsProvider(mySettableClock, url, accessKeyId, accessKeySecret),
+                new JacksonSerializer());
         
         Fresh<AccessTokenResponse> freshToken = tokenEndpoint.
                 requestAutoRefreshingToken(new ClientCredentialsGrantRequest());
@@ -270,7 +286,7 @@ public class HereAccountTest extends AbstractCredentialTezt {
         Assert.assertEquals("12345", freshToken.get().getAccessToken());
         Assert.assertEquals("12345", freshToken.get().getAccessToken());
         // wait for refresh
-        Thread.sleep(31000);
+        Thread.sleep(sleepTimeMillis + 100L);
         // verify validToken2
         Assert.assertEquals("67890", freshToken.get().getAccessToken());
     }
