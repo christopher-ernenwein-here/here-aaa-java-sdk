@@ -21,8 +21,11 @@ import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.net.URL;
 import java.util.function.Supplier;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 import com.here.account.auth.NoAuthorizer;
+import com.here.account.auth.provider.ClientAuthorizationProviderChain;
 import com.here.account.client.Client;
 import com.here.account.http.HttpConstants;
 import com.here.account.http.HttpConstants.HttpMethods;
@@ -251,6 +254,9 @@ public class HereAccount {
      * Implementation of {@link TokenEndpoint}.
      */
     private static class TokenEndpointImpl implements TokenEndpoint {
+        private static final Logger LOGGER = Logger.getLogger(TokenEndpointImpl.class.getName());
+
+
         /**
          * @deprecated to be removed.
          */
@@ -298,8 +304,10 @@ public class HereAccount {
             this.httpProvider = httpProvider;
             this.serializer = serializer;
 
+            requestTokenFromFile = null != url && url.startsWith(FILE_URL_START);
+
             if (currentTimeMillisSettable = clock instanceof SettableClock
-                    && url.endsWith(SLASH_TOKEN)) {
+                    && null != url && url.endsWith(SLASH_TOKEN)) {
                 settableClock = (SettableClock) clock;
                 timestampUrl = url.substring(0, url.length() - SLASH_TOKEN.length()) + SLASH_TIMESTAMP;
             } else {
@@ -307,7 +315,6 @@ public class HereAccount {
                 timestampUrl = null;
             }
 
-            requestTokenFromFile = null != url && url.startsWith(FILE_URL_START);
         }
         
         protected AccessTokenResponse requestTokenFromFile() 
@@ -389,12 +396,19 @@ public class HereAccount {
                                                           AccessTokenException e) {
             if (canFixClockSkew(retryFixableErrorsCount, e)) {
                 // correct the Clock
-                TimestampResponse timestampResponse = getServerTimestamp();
-                long timestamp = timestampResponse.getTimestamp();
-                settableClock.setCurrentTimeMillis(timestamp * CONVERT_SECONDS_TO_MILLISECONDS);
+                try {
+                    TimestampResponse timestampResponse = getServerTimestamp();
+                    long timestamp = timestampResponse.getTimestamp();
+                    settableClock.setCurrentTimeMillis(timestamp * CONVERT_SECONDS_TO_MILLISECONDS);
+                } catch (Exception e2) {
+                    // trouble correcting the clock
+                    LOGGER.warning(() -> "correcting clock skew, trouble getting timestamp: " + e2);
+                    throw e;
+                }
 
                 // retry
                 return requestTokenHttp(authorizationRequest, retryFixableErrorsCount - 1);
+
             }
             throw e;
         }
