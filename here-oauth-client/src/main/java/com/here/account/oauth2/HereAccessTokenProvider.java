@@ -109,7 +109,6 @@ public class HereAccessTokenProvider implements AccessTokenProvider, Closeable {
         private HttpProvider httpProvider;
         private boolean alwaysRequestNewToken = false;
         private Serializer serializer;
-        private Clock clock;
 
         private Builder() {
         }
@@ -158,21 +157,6 @@ public class HereAccessTokenProvider implements AccessTokenProvider, Closeable {
         }
 
         /**
-         * Optionally set the Clock to be used in the resulting
-         * HERE Access Token provider.
-         * If both this and clientAuthorizationRequestProvider are
-         * set, use the same Clock in both, to get timestamp
-         * corrections from the server.
-         *
-         * @param clock the Clock implementation to use
-         * @return this Builder
-         */
-        public Builder setClock(Clock clock) {
-            this.clock = clock;
-            return this;
-        }
-
-        /**
          * Optionally override the default JSON Serializer.
          *
          * @param serializer the serializer to set
@@ -191,14 +175,9 @@ public class HereAccessTokenProvider implements AccessTokenProvider, Closeable {
          */
         public HereAccessTokenProvider build() {
 
-            // attempt to use the same clock for correction,
-            // that is used by the clientAuthorizationRequestProvider
-            if (null == clock) {
-                clock = HereAccount.reuseClock(clientAuthorizationRequestProvider);
-            }
-
             if (null == clientAuthorizationRequestProvider) {
                 // use the default provider chain
+                Clock clock = new SettableSystemClock();
                 this.clientAuthorizationRequestProvider = 
                         ClientAuthorizationProviderChain.getNewDefaultClientCredentialsProviderChain(clock);
             }
@@ -216,7 +195,6 @@ public class HereAccessTokenProvider implements AccessTokenProvider, Closeable {
             }
 
             return new HereAccessTokenProvider(
-                    clock,
                     serializer,
                     clientAuthorizationRequestProvider,
                     httpProvider,
@@ -225,7 +203,6 @@ public class HereAccessTokenProvider implements AccessTokenProvider, Closeable {
         }
     }
 
-    private final Clock clock;
     private final Serializer serializer;
     private final HttpProvider httpProvider;
     private final boolean doCloseHttpProvider;
@@ -235,14 +212,13 @@ public class HereAccessTokenProvider implements AccessTokenProvider, Closeable {
 
 
     private HereAccessTokenProvider(
-            Clock clock, Serializer serializer,
+            Serializer serializer,
             ClientAuthorizationRequestProvider credentials, HttpProvider httpProvider,
             boolean doCloseHttpProvider, boolean alwaysRequestNewToken) {
-        this.clock = clock;
         this.serializer = serializer;
         this.httpProvider = httpProvider;
         this.doCloseHttpProvider = doCloseHttpProvider;
-        this.tokenEndpoint = HereAccount.getTokenEndpoint(clock, httpProvider, credentials, serializer);
+        this.tokenEndpoint = HereAccount.getTokenEndpoint(httpProvider, credentials, this.serializer);
         this.accessTokenRequestSupplier = () -> {
             return credentials.getNewAccessTokenRequest();
         };

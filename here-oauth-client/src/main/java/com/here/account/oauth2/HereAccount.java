@@ -166,7 +166,7 @@ public class HereAccount {
      * @param clientAuthorizationRequestProvider the authorization provider
      * @return the clock to use
      */
-    static Clock reuseClock(ClientAuthorizationRequestProvider clientAuthorizationRequestProvider) {
+    private static Clock reuseClock(ClientAuthorizationRequestProvider clientAuthorizationRequestProvider) {
         Clock clock = null;
         if (null != clientAuthorizationRequestProvider) {
             clock = clientAuthorizationRequestProvider.getClock();
@@ -204,7 +204,7 @@ public class HereAccount {
      * @param serializer the Serializer to use
      * @return a {@code TokenEndpoint} representing access for the provided client
      */
-    public static TokenEndpoint getTokenEndpoint(Clock clock,
+    private static TokenEndpoint getTokenEndpoint(Clock clock,
                                                  HttpProvider httpProvider,
             ClientAuthorizationRequestProvider clientCredentialsProvider,
             Serializer serializer) {
@@ -259,6 +259,10 @@ public class HereAccount {
 
         private final boolean currentTimeMillisSettable;
         private final Clock clock;
+        private final SettableClock settableClock;
+        private final String timestampUrl;
+        private final boolean requestTokenFromFile;
+
         private final Client client;
         private final HttpProvider httpProvider;
         private final HttpMethods httpMethod;
@@ -277,12 +281,12 @@ public class HereAccount {
          */
         private TokenEndpointImpl(
                 Clock clock,
-                HttpProvider httpProvider, ClientAuthorizationRequestProvider clientAuthorizationProvider,
+                HttpProvider httpProvider,
+                ClientAuthorizationRequestProvider clientAuthorizationProvider,
                 Serializer serializer) {
             // these values are fixed once selected
             this.clock = clock;
             this.url = clientAuthorizationProvider.getTokenEndpointUrl();
-            setTimestampUrl();
             this.clientAuthorizer = clientAuthorizationProvider.getClientAuthorizer();
             this.httpMethod = clientAuthorizationProvider.getHttpMethod();
 
@@ -294,7 +298,16 @@ public class HereAccount {
             this.httpProvider = httpProvider;
             this.serializer = serializer;
 
-            this.currentTimeMillisSettable = clock instanceof SettableClock;
+            if (currentTimeMillisSettable = clock instanceof SettableClock
+                    && url.endsWith(SLASH_TOKEN)) {
+                settableClock = (SettableClock) clock;
+                timestampUrl = url.substring(0, url.length() - SLASH_TOKEN.length()) + SLASH_TIMESTAMP;
+            } else {
+                settableClock = null;
+                timestampUrl = null;
+            }
+
+            requestTokenFromFile = null != url && url.startsWith(FILE_URL_START);
         }
         
         protected AccessTokenResponse requestTokenFromFile() 
@@ -308,15 +321,11 @@ public class HereAccount {
         }
         
         private static final String FILE_URL_START = "file://";
-        
-        protected boolean isRequestTokenFromFile() {
-            return null != url && url.startsWith(FILE_URL_START);
-        }
-        
+
         @Override
         public AccessTokenResponse requestToken(AccessTokenRequest authorizationRequest) 
                 throws AccessTokenException, RequestExecutionException, ResponseParsingException {            
-            if (isRequestTokenFromFile()) {
+            if (requestTokenFromFile) {
                 return requestTokenFromFile();
             } else {
                 return requestTokenHttp(authorizationRequest, 1);
@@ -351,37 +360,38 @@ public class HereAccount {
         private static final String SLASH_TIMESTAMP = "/timestamp";
         private final NoAuthorizer noAuthorizer = new NoAuthorizer();
 
-        private String timestampUrl;
+        protected boolean canFixClockSkew(int retryFixableErrorsCount,
+                                          AccessTokenException e) {
+            ErrorResponse errorResponse;
+            return currentTimeMillisSettable && retryFixableErrorsCount > 0
+                    && null != e && CLOCK_SKEW_STATUS_CODE == e.getStatusCode()
+                    && null != (errorResponse = e.getErrorResponse()) && CLOCK_SKEW_ERROR_CODE == errorResponse.getErrorCode();
+        }
 
-        protected void setTimestampUrl() {
-            if (url.endsWith(SLASH_TOKEN)) {
-                timestampUrl = url.substring(0, url.length() - SLASH_TOKEN.length()) + SLASH_TIMESTAMP;
-            }
+        protected TimestampResponse getServerTimestamp() {
+            // we have a clock skew
+            String method = HttpConstants.HttpMethods.GET.getMethod();
+
+            HttpProvider.HttpRequest httpRequest;
+            httpRequest = httpProvider.getRequest(
+                    noAuthorizer, method, timestampUrl, (String) null);
+
+            TimestampResponse timestampResponse = client.sendMessage(httpRequest, TimestampResponse.class,
+                    ErrorResponse.class, (statusCode, errorResponse2) -> {
+                        return new AccessTokenException(statusCode, errorResponse2);
+                    });
+
+            return timestampResponse;
         }
 
         protected AccessTokenResponse handleFixableErrors(AccessTokenRequest authorizationRequest,
                                                           int retryFixableErrorsCount,
                                                           AccessTokenException e) {
-            ErrorResponse errorResponse;
-            if (retryFixableErrorsCount > 0 && null != timestampUrl && null != e
-                && CLOCK_SKEW_STATUS_CODE == e.getStatusCode()
-                && null != (errorResponse = e.getErrorResponse()) && CLOCK_SKEW_ERROR_CODE == errorResponse.getErrorCode()
-                && currentTimeMillisSettable) {
-
-                // we have a clock skew
-                String method = HttpConstants.HttpMethods.GET.getMethod();
-
-                HttpProvider.HttpRequest httpRequest;
-                httpRequest = httpProvider.getRequest(
-                        noAuthorizer, method, timestampUrl, (String) null);
-
-                TimestampResponse timestampResponse = client.sendMessage(httpRequest, TimestampResponse.class,
-                        ErrorResponse.class, (statusCode, errorResponse2) -> {
-                            return new AccessTokenException(statusCode, errorResponse2);
-                        });
+            if (canFixClockSkew(retryFixableErrorsCount, e)) {
                 // correct the Clock
+                TimestampResponse timestampResponse = getServerTimestamp();
                 long timestamp = timestampResponse.getTimestamp();
-                ((SettableClock) clock).setCurrentTimeMillis(timestamp * CONVERT_SECONDS_TO_MILLISECONDS);
+                settableClock.setCurrentTimeMillis(timestamp * CONVERT_SECONDS_TO_MILLISECONDS);
 
                 // retry
                 return requestTokenHttp(authorizationRequest, retryFixableErrorsCount - 1);

@@ -258,20 +258,19 @@ public class HereAccountTest extends AbstractCredentialTezt {
                 + " \"access_token\": \"67890\","
                 + " \"expires_in\": 30"
                 + "}";
-        final long sleepTimeMillis = 1000L;
-        Clock mySettableClock = new SettableSystemClock() {
-            @Override
-            public void schedule(ScheduledExecutorService scheduledExecutorService,
-                                             Runnable runnable,
-                                             long millisecondsInTheFutureToSchedule
-            ) {
-                super.schedule(scheduledExecutorService, runnable, sleepTimeMillis);
-            }
-        };
+        final long sleepTimeMillis = 800L;
+            Clock mySettableClock = new SettableSystemClock() {
+                @Override
+                public void schedule(ScheduledExecutorService scheduledExecutorService,
+                                                 Runnable runnable,
+                                                 long millisecondsInTheFutureToSchedule
+                ) {
+                    super.schedule(scheduledExecutorService, runnable, sleepTimeMillis);
+                }
+            };
         
-        TokenEndpoint tokenEndpoint = HereAccount.getTokenEndpoint(
-                mySettableClock,
-                mockHttpProvider(dummyResponse(200, 
+        TokenEndpoint tokenEndpoint = (TokenEndpoint) HereAccount.getTokenEndpoint(
+                mockHttpProvider(dummyResponse(200,
                                                validToken1.getBytes().length, 
                                                new ByteArrayInputStream(validToken1.getBytes("UTF-8"))),
                                  dummyResponse(200,
